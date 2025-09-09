@@ -44,19 +44,49 @@ main() {
   # Set valid header values for GitHub REST API requests.
   set -- "${@}" -H "${accept_header}" -H "${authorization_header}" -H "${api_version_header}"
 
-  # Get pull request URLs for all relevant notifications.
-  curl "$@" "https://api.github.com/notifications" | jq -r '.[] | select( .subject.type == "PullRequest" ) | .subject.url' |
-    while IFS= read -r pull_request_url; do
-      # Get the branch name (.head.ref) for Dependabot pull requests that bump GitHub Actions dependencies.
-      curl "$@" "${pull_request_url}" | jq -r 'select( .head.ref | contains("dependabot/github_actions") ) | .head.ref' |
-        while IFS= read -r branch_name; do
-          # Verify status checks have run against the latest commit to the branch.
-          check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
+  # GitHub API Endpoints
+  notifications_endpoint="https://api.github.com/notifications"
+
+  # Get thread identifier for all relevant notifications.
+  curl "$@" "${notifications_endpoint}" | jq -r '.[] | select( .subject.type == "PullRequest" ) | .id' |
+    while IFS= read -r thread_id; do
+      # Get details about the pull request being referenced in the notification thread.
+      notification_thread_url="${notifications_endpoint}/threads/${thread_id}"
+      pull_request_url="$(curl "$@" "${notification_thread_url}" | jq -r '.subject.url')"
+      branch_name="$(curl "$@" "${pull_request_url}" | jq -r '.head.ref')"
+      git_ref_url="${pull_request_url%/pulls/*}/git/refs/heads/${branch_name}"
+      check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
+
+      # If the pull request is already merged/closed, clear the notification and move on to the next one.
+      if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+        curl --request PATCH "$@" "${notification_thread_url}"
+        curl --request DELETE "$@" "${notification_thread_url}"
+        continue
+      fi
+
+      # Check for Dependabot pull requests that bump GitHub Actions dependencies.
+      case "${branch_name}" in
+      *dependabot/github_actions*)
+        # Continue if the branch still exists.
+        if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+          # Merge the pull request if all status checks have passed.
           if curl "$@" "${check_runs_url}" | validate_checks; then
-            # Merge a pull request if all checks are valid.
-            curl "$@" --request PUT "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
+            curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
+            # Wait for Dependabot to automatically delete the pull request branch.
+            sleep 3
+            # Verify the pull request has been closed and merged, deleting the branch if still present.
+            if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+              if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+                curl --request DELETE "$@" "${git_ref_url}"
+              fi
+            fi
+            # Clear the notification.
+            curl --request PATCH "$@" "${notification_thread_url}"
+            curl --request DELETE "$@" "${notification_thread_url}"
           fi
-        done
+        fi
+        ;;
+      esac
     done
 }
 
