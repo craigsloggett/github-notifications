@@ -15,10 +15,9 @@ ensure_utility() {
 
 validate_checks() {
   # Expects a JSON response from the check-runs GitHub API endpoint as stdin.
-  # select( ( .check_runs | length ) > 0 )                                  : Verify checks have run.
   # .check_runs.[] | ( .status == "completed" and .conclusion == "success" ): Returns true for each check that has completed successfully.
-  # [ ] | all                                                               : Returns true if all checks have completed successfully.
-  jq -e 'select( ( .check_runs | length ) > 0 ) | [ .check_runs.[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
+  # [ ] | all                                                               : Returns true if all checks have completed successfully, or there are no checks at all.
+  jq -e '[ .check_runs.[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
 }
 
 main() {
