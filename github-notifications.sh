@@ -54,7 +54,7 @@ main() {
           check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
           if curl "$@" "${check_runs_url}" | validate_checks; then
             # Merge a pull request if all checks are valid.
-            curl "$@" --method PUT "${pull_request_url}/merge" -f 'merge_method=squash'
+            curl "$@" --request PUT "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
           fi
         done
     done
