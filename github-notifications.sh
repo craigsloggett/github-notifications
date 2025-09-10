@@ -59,41 +59,37 @@ main() {
       git_ref_url="${pull_request_url%/pulls/*}/git/refs/heads/${branch_name}"
       check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
 
-      # If the pull request is already merged/closed, clear the notification and move on to the next one.
-      if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+      # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
+      if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" )' >/dev/null; then
         curl --request PATCH "$@" "${notification_thread_url}"
         curl --request DELETE "$@" "${notification_thread_url}"
         continue
       fi
 
+      # At this point, assume the pull request is open and the ref branch exists.
       case "${branch_name}" in
         *dependabot/github_actions*)
+          # Validate the pull request checks have completed successfully.
+          # (returns true if there are no checks configured)
+          if curl "$@" "${check_runs_url}" | validate_checks; then
 
-          # Continue if the branch still exists.
-          if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+            # Merge the pull request.
+            curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
 
-            # Validate the pull request checks have completed successfully.
-            # (returns true if there are no checks configured)
-            if curl "$@" "${check_runs_url}" | validate_checks; then
+            # Wait for Dependabot to automatically delete the pull request branch.
+            sleep 3
 
-              # Merge the pull request.
-              curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
-
-              # Wait for Dependabot to automatically delete the pull request branch.
-              sleep 3
-
-              # Verify the pull request has been closed and merged.
-              if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
-                # Delete the branch if it still exists.
-                if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
-                  curl --request DELETE "$@" "${git_ref_url}"
-                fi
+            # Verify the pull request has been closed and merged.
+            if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+              # Delete the branch if it still exists.
+              if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+                curl --request DELETE "$@" "${git_ref_url}"
               fi
-
-              # Mark the notification as read, then done.
-              curl --request PATCH "$@" "${notification_thread_url}"
-              curl --request DELETE "$@" "${notification_thread_url}"
             fi
+
+            # Mark the notification as read, then done.
+            curl --request PATCH "$@" "${notification_thread_url}"
+            curl --request DELETE "$@" "${notification_thread_url}"
           fi
           ;;
       esac
