@@ -48,10 +48,11 @@ main() {
   # GitHub API Endpoints
   notifications_endpoint="https://api.github.com/notifications"
 
+  printf '%s\n' "Looking for pull request notifications..."
+
   # Iterate over all pull request notification threads in the authenticated user's inbox.
   curl "$@" "${notifications_endpoint}" | jq -r '.[] | select( .subject.type == "PullRequest" ) | .id' |
     while IFS= read -r thread_id; do
-
       # Grab a bunch of details from the notification with jq and parameter expansion magic.
       notification_thread_url="${notifications_endpoint}/threads/${thread_id}"
       pull_request_url="$(curl "$@" "${notification_thread_url}" | jq -r '.subject.url')"
@@ -59,8 +60,12 @@ main() {
       git_ref_url="${pull_request_url%/pulls/*}/git/refs/heads/${branch_name}"
       check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
 
+      printf '%s\n' "Processing notification for: ${pull_request_url}"
+
       # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
       if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" )' >/dev/null; then
+        printf '%s\n' "--> Pull request is already closed, marking the notification as done."
+
         curl --request PATCH "$@" "${notification_thread_url}"
         curl --request DELETE "$@" "${notification_thread_url}"
         continue
@@ -69,9 +74,12 @@ main() {
       # At this point, assume the pull request is open and the ref branch exists.
       case "${branch_name}" in
         *dependabot/github_actions*)
+          printf '%s\n' "--> Found a Dependabot pull request, updating a GitHub Actions dependency."
+
           # Validate the pull request checks have completed successfully.
           # (returns true if there are no checks configured)
           if curl "$@" "${check_runs_url}" | validate_checks; then
+            printf '%s\n' "--> Status checks have passed, merging the pull request."
 
             # Merge the pull request.
             curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
@@ -87,10 +95,17 @@ main() {
               fi
             fi
 
+            printf '%s\n' "--> Pull request has been merged, marking the notification as done."
+
             # Mark the notification as read, then done.
             curl --request PATCH "$@" "${notification_thread_url}"
             curl --request DELETE "$@" "${notification_thread_url}"
+          else
+            printf '%s\n' "--> Status checks have not passed, unable to merge the pull request."
           fi
+          ;;
+        *)
+          printf '%s\n' "--> This pull request requires manual intervention."
           ;;
       esac
     done
