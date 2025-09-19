@@ -21,6 +21,25 @@ validate_checks() {
   jq -e '[ .check_runs.[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
 }
 
+generate_docs() {
+  # Ensure required utilities are available.
+  for utility in git terraform-docs; do
+    ensure_utility "${utility}"
+  done
+
+  XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+  tmpdir="${TMPDIR:-${XDG_CACHE_HOME}/github-notifications}"
+
+  if command -v mktemp >/dev/null; then
+    tmp="$(mktemp --directory "${tmpdir}/tmp.XXXXXXXXXX")"
+  else
+    tmp="${tmpdir}/tmp.$$" && (umask 077 && mkdir -p "${tmp}")
+  fi
+
+  printf 'Created temporary directory: %s\n' "${tmp}"
+  trap 'rm -rf "${tmp}"' EXIT
+}
+
 main() {
   set -euf
 
