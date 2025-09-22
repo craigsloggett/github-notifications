@@ -71,38 +71,68 @@ main() {
         continue
       fi
 
-      # At this point, assume the pull request is open and the ref branch exists.
+      # Validate the pull request checks have completed successfully.
+      # (returns true if there are no checks configured)
+      if curl "$@" "${check_runs_url}" | validate_checks; then
+        printf '%s\n' "--> Status checks have passed, considering the Pull Request type."
+      else
+        printf '%s\n' "--> Status checks have not passed, this pull request requires manual intervention."
+        continue
+      fi
+
+      # At this point, assume the pull request is open and the ref branch exists, and the status checks have passed.
       case "${branch_name}" in
         *dependabot/github_actions*)
-          printf '%s\n' "--> Found a Dependabot pull request, updating a GitHub Actions dependency."
+          printf '%s\n' "--> Dependabot is updating a GitHub Actions dependency, merging the pull request."
 
-          # Validate the pull request checks have completed successfully.
-          # (returns true if there are no checks configured)
-          if curl "$@" "${check_runs_url}" | validate_checks; then
-            printf '%s\n' "--> Status checks have passed, merging the pull request."
+          # Merge the pull request.
+          curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
 
-            # Merge the pull request.
-            curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
+          # Wait for Dependabot to automatically delete the pull request branch.
+          sleep 3
 
-            # Wait for Dependabot to automatically delete the pull request branch.
-            sleep 3
-
-            # Verify the pull request has been closed and merged.
-            if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
-              # Delete the branch if it still exists.
-              if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
-                curl --request DELETE "$@" "${git_ref_url}"
-              fi
+          # Verify the pull request has been closed and merged.
+          if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+            # Delete the branch if it still exists.
+            if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+              curl --request DELETE "$@" "${git_ref_url}"
             fi
-
-            printf '%s\n' "--> Pull request has been merged, marking the notification as done."
-
-            # Mark the notification as read, then done.
-            curl --request PATCH "$@" "${notification_thread_url}"
-            curl --request DELETE "$@" "${notification_thread_url}"
           else
-            printf '%s\n' "--> Status checks have not passed, unable to merge the pull request."
+            printf '%s\n' "--> The pull request was not merged and closed, this requires manual intervention."
+            continue
           fi
+
+          printf '%s\n' "--> Pull request has been merged, marking the notification as done."
+
+          # Mark the notification as read, then done.
+          curl --request PATCH "$@" "${notification_thread_url}"
+          curl --request DELETE "$@" "${notification_thread_url}"
+          ;;
+        *dependabot/go_modules*)
+          printf '%s\n' "--> Dependabot is updating a Go module dependency, merging the pull request."
+
+          # Merge the pull request.
+          curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
+
+          # Wait for Dependabot to automatically delete the pull request branch.
+          sleep 3
+
+          # Verify the pull request has been closed and merged.
+          if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+            # Delete the branch if it still exists.
+            if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
+              curl --request DELETE "$@" "${git_ref_url}"
+            fi
+          else
+            printf '%s\n' "--> The pull request was not merged and closed, this requires manual intervention."
+            continue
+          fi
+
+          printf '%s\n' "--> Pull request has been merged, marking the notification as done."
+
+          # Mark the notification as read, then done.
+          curl --request PATCH "$@" "${notification_thread_url}"
+          curl --request DELETE "$@" "${notification_thread_url}"
           ;;
         *)
           printf '%s\n' "--> This pull request requires manual intervention."
