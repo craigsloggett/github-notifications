@@ -30,8 +30,13 @@ merge_pull_request() {
   pull_request_endpoint="${1}"
   head_branch_git_reference_endpoint="${2}"
 
+  # Set the default curl options for all GitHub REST API calls.
+  set -- --silent --location
+  # Set valid header values for GitHub REST API requests.
+  set -- "${@}" -H "${accept_header}" -H "${authorization_header}" -H "${api_version_header}"
+
   # Merge the pull request.
-  curl --request PUT "$@" "${pull_request_endpoint}/merge" -d '{ "merge_method": "squash" }'
+  curl --request PUT "$@" "${pull_request_endpoint}/merge" -d '{ "merge_method": "squash" }' >/dev/null
 
   # Wait for GitHub to automatically delete the branch being merged if that is
   # configured.
@@ -41,7 +46,7 @@ merge_pull_request() {
   if curl "$@" "${pull_request_endpoint}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
     # Delete the branch if it still exists.
     if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${head_branch_git_reference_endpoint}")" -eq 200 ]; then
-      : #curl --request DELETE "$@" "${head_branch_git_reference_endpoint}"
+      curl --request DELETE "$@" "${head_branch_git_reference_endpoint}"
     fi
   else
     printf 'WARN: The pull request was not merged, this requires manual intervention.\n'
