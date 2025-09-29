@@ -6,10 +6,30 @@ trap_EXIT() {
   [ "${status}" -ne 0 ] && printf '%s\n' "Exit Status: ${status}"
 }
 
+log() {
+  message="${1}"
+
+  printf '%b%s%b %s\n' "${bold}" "INFO:" "${reset}" "${message}"
+}
+
+warn() {
+  message="${1}"
+
+  printf '%b%s%b %s\n' "${bold_yellow}" "WARN:" "${reset}" "${message}"
+}
+
+error() {
+  message="${1}"
+
+  printf '%b%s%b %s\n' "${bold_red}" "ERROR:" "${reset}" "${message}"
+}
+
 ensure_utility() {
   # Expects a utility as the first positional parameter and checks if it is available to run.
-  command -v "${1}" >/dev/null || {
-    printf 'ERROR: %s is not available and is required.\n' "${1}"
+  utility="${1}"
+
+  command -v "${utility}" >/dev/null || {
+    error "The following utility is not available and is required --> ${utility}"
     exit 1
   }
 }
@@ -21,6 +41,37 @@ validate_checks() {
   jq -e '[ .check_runs.[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
 }
 
+merge_pull_request() {
+  # Expects a pull request endpoint as the first positional parameter and
+  # the corresponding git reference (branch) endpoint for the branch that
+  # is being merged as the second.
+  pull_request_endpoint="${1}"
+  head_branch_git_reference_endpoint="${2}"
+
+  # Set the default curl options for all GitHub REST API calls.
+  set -- --silent --location
+  # Set valid header values for GitHub REST API requests.
+  set -- "${@}" -H "${accept_header}" -H "${authorization_header}" -H "${api_version_header}"
+
+  # Merge the pull request.
+  curl --request PUT "$@" "${pull_request_endpoint}/merge" -d '{ "merge_method": "squash" }' >/dev/null
+
+  # Wait for GitHub to automatically delete the branch being merged if that is
+  # configured.
+  sleep 3
+
+  # Verify the pull request has been closed and merged.
+  if curl "$@" "${pull_request_endpoint}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+    # Delete the branch if it still exists.
+    if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${head_branch_git_reference_endpoint}")" -eq 200 ]; then
+      curl --request DELETE "$@" "${head_branch_git_reference_endpoint}"
+    fi
+  else
+    warn "The pull request was not merged, this requires manual intervention."
+    return 1
+  fi
+}
+
 main() {
   set -euf
 
@@ -29,6 +80,12 @@ main() {
 
   # trap will catch all EXIT signals from here forward.
   trap trap_EXIT EXIT
+
+  # ANSI escape sequences used for text output.
+  bold_yellow='\033[1;33m'
+  bold_red='\033[1;31m'
+  bold='\033[1m'
+  reset='\033[m'
 
   # Ensure required utilities are available.
   for utility in curl jq; do
@@ -48,94 +105,78 @@ main() {
   # GitHub API Endpoints
   notifications_endpoint="https://api.github.com/notifications"
 
-  printf '%s\n' "Looking for pull request notifications..."
+  log "Listing notifications for the authenticated user ..."
 
-  # Iterate over all pull request notification threads in the authenticated user's inbox.
-  curl "$@" "${notifications_endpoint}" | jq -r '.[] | select( .subject.type == "PullRequest" ) | .id' |
-    while IFS= read -r thread_id; do
-      # Grab a bunch of details from the notification with jq and parameter expansion magic.
-      notification_thread_url="${notifications_endpoint}/threads/${thread_id}"
-      pull_request_url="$(curl "$@" "${notification_thread_url}" | jq -r '.subject.url')"
-      branch_name="$(curl "$@" "${pull_request_url}" | jq -r '.head.ref')"
-      git_ref_url="${pull_request_url%/pulls/*}/git/refs/heads/${branch_name}"
-      check_runs_url="${pull_request_url%/pulls/*}/commits/${branch_name}/check-runs"
+  # Filter the notifications endpoint response on subject type to grab pull request notifications.
+  pull_request_notifications_json="$(curl "$@" "${notifications_endpoint}" | jq -r '.[] | select( .subject.type == "PullRequest" )')"
 
-      printf '%s\n' "Processing notification for: ${pull_request_url}"
+  # Iterate over each unique pull request notification thread identifier.
+  printf '%s' "${pull_request_notifications_json}" | jq -r '.id' |
+    while read -r notification_thread_id; do
+      # Isolate details of the notification being processed.
+      notification_thread_json="$(printf '%s' "${pull_request_notifications_json}" | jq -r "select( .id == \"${notification_thread_id}\" )")"
+      notification_thread_endpoint="$(printf '%s' "${notification_thread_json}" | jq -r '.url')"
+      repository_endpoint="$(printf '%s' "${notification_thread_json}" | jq -r '.repository.url')"
+      pull_request_endpoint="$(printf '%s' "${notification_thread_json}" | jq -r '.subject.url')"
+
+      # Isolate details of the pull request being processed.
+      pull_request_json="$(curl "$@" "${pull_request_endpoint}")"
+      # The branch whose changes are combined into the base branch when you
+      # merge a pull request. Also known as the "compare branch."
+      head_branch_name="$(printf '%s' "${pull_request_json}" | jq -r '.head.ref')"
+      # The REF in the URL must be formatted as heads/<branch name> for
+      # branches and tags/<tag name> for tags.
+      head_branch_git_reference_endpoint="${repository_endpoint}/git/ref/heads/${head_branch_name}"
+      # The REF can be a SHA, branch name, or a tag name.
+      check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
+
+      log "Processing notification for: ${pull_request_endpoint}"
 
       # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
-      if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" )' >/dev/null; then
-        printf '%s\n' "--> Pull request is already closed, marking the notification as done."
+      if printf '%s' "${pull_request_json}" | jq -e '( .state == "closed" )' >/dev/null; then
+        log "Pull request is closed, marking the notification as done ..."
 
-        curl --request PATCH "$@" "${notification_thread_url}"
-        curl --request DELETE "$@" "${notification_thread_url}"
+        curl --request PATCH "$@" "${notification_thread_endpoint}"
+        curl --request DELETE "$@" "${notification_thread_endpoint}"
         continue
       fi
 
       # Validate the pull request checks have completed successfully.
       # (returns true if there are no checks configured)
-      if curl "$@" "${check_runs_url}" | validate_checks; then
-        printf '%s\n' "--> Status checks have passed, considering the Pull Request type."
+      if curl "$@" "${check_runs_endpoint}" | validate_checks; then
+        log "Status checks have passed, reviewing the Pull Request type ..."
       else
-        printf '%s\n' "--> Status checks have not passed, this pull request requires manual intervention."
+        warn "Status checks have not passed, this pull request requires manual intervention."
         continue
       fi
 
       # At this point, assume the pull request is open and the ref branch exists, and the status checks have passed.
-      case "${branch_name}" in
+      case "${head_branch_name}" in
         *dependabot/github_actions*)
-          printf '%s\n' "--> Dependabot is updating a GitHub Actions dependency, merging the pull request."
+          log "Dependabot is updating a GitHub Actions dependency, merging the pull request ..."
 
           # Merge the pull request.
-          curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
-
-          # Wait for Dependabot to automatically delete the pull request branch.
-          sleep 3
-
-          # Verify the pull request has been closed and merged.
-          if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
-            # Delete the branch if it still exists.
-            if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
-              curl --request DELETE "$@" "${git_ref_url}"
-            fi
-          else
-            printf '%s\n' "--> The pull request was not merged and closed, this requires manual intervention."
-            continue
-          fi
-
-          printf '%s\n' "--> Pull request has been merged, marking the notification as done."
+          merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
           # Mark the notification as read, then done.
-          curl --request PATCH "$@" "${notification_thread_url}"
-          curl --request DELETE "$@" "${notification_thread_url}"
+          log "Pull request has been merged, marking the notification as done ..."
+          curl --request PATCH "$@" "${notification_thread_endpoint}"
+          curl --request DELETE "$@" "${notification_thread_endpoint}"
           ;;
         *dependabot/go_modules*)
-          printf '%s\n' "--> Dependabot is updating a Go module dependency, merging the pull request."
+          log "Dependabot is updating a Go module dependency, merging the pull request ..."
 
           # Merge the pull request.
-          curl --request PUT "$@" "${pull_request_url}/merge" -d '{ "merge_method": "squash" }'
+          merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
-          # Wait for Dependabot to automatically delete the pull request branch.
-          sleep 3
-
-          # Verify the pull request has been closed and merged.
-          if curl "$@" "${pull_request_url}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
-            # Delete the branch if it still exists.
-            if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${git_ref_url}")" -eq 200 ]; then
-              curl --request DELETE "$@" "${git_ref_url}"
-            fi
-          else
-            printf '%s\n' "--> The pull request was not merged and closed, this requires manual intervention."
-            continue
-          fi
-
-          printf '%s\n' "--> Pull request has been merged, marking the notification as done."
+          log "Pull request has been merged, marking the notification as done ..."
 
           # Mark the notification as read, then done.
-          curl --request PATCH "$@" "${notification_thread_url}"
-          curl --request DELETE "$@" "${notification_thread_url}"
+          curl --request PATCH "$@" "${notification_thread_endpoint}"
+          curl --request DELETE "$@" "${notification_thread_endpoint}"
           ;;
         *)
-          printf '%s\n' "--> This pull request requires manual intervention."
+          warn "This pull request requires manual intervention."
           ;;
       esac
     done
