@@ -104,7 +104,7 @@ main() {
       # branches and tags/<tag name> for tags.
       head_branch_git_reference_endpoint="${repository_endpoint}/git/ref/heads/${head_branch_name}"
       # The REF can be a SHA, branch name, or a tag name.
-      list_check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
+      check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
 
       printf 'INFO: Processing notification for: %s\n' "${pull_request_endpoint}"
 
@@ -119,7 +119,7 @@ main() {
 
       # Validate the pull request checks have completed successfully.
       # (returns true if there are no checks configured)
-      if curl "$@" "${list_check_runs_endpoint}" | validate_checks; then
+      if curl "$@" "${check_runs_endpoint}" | validate_checks; then
         printf 'INFO: Status checks have passed, considering the Pull Request type.\n'
       else
         printf 'WARN: Status checks have not passed, this pull request requires manual intervention.\n'
