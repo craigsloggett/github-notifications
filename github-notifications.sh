@@ -130,6 +130,7 @@ main() {
       # The REF can be a SHA, branch name, or a tag name.
       check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
 
+      log "" # Create a visual break for new notifications.
       log "Processing notification for: ${pull_request_endpoint}"
 
       # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
@@ -159,7 +160,7 @@ main() {
           merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
           # Mark the notification as read, then done.
-          log "Pull request has been merged, marking the notification as done ..."
+          log "✅ Pull request has been merged, marking the notification as done ..."
           curl --request PATCH "$@" "${notification_thread_endpoint}"
           curl --request DELETE "$@" "${notification_thread_endpoint}"
           ;;
@@ -169,7 +170,7 @@ main() {
           # Merge the pull request.
           merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
-          log "Pull request has been merged, marking the notification as done ..."
+          log "✅ Pull request has been merged, marking the notification as done ..."
 
           # Mark the notification as read, then done.
           curl --request PATCH "$@" "${notification_thread_endpoint}"
