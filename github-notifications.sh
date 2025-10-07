@@ -160,7 +160,7 @@ main() {
           merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
           # Mark the notification as read, then done.
-          log "✅ Pull request has been merged, marking the notification as done ..."
+          log "Pull request has been merged, marking the notification as done ..."
           curl --request PATCH "$@" "${notification_thread_endpoint}"
           curl --request DELETE "$@" "${notification_thread_endpoint}"
           ;;
@@ -170,7 +170,7 @@ main() {
           # Merge the pull request.
           merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
 
-          log "✅ Pull request has been merged, marking the notification as done ..."
+          log "Pull request has been merged, marking the notification as done ..."
 
           # Mark the notification as read, then done.
           curl --request PATCH "$@" "${notification_thread_endpoint}"
