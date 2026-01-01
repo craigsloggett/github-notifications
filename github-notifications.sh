@@ -62,9 +62,11 @@ merge_pull_request() {
 
   # Verify the pull request has been closed and merged.
   if curl "$@" "${pull_request_endpoint}" | jq -e '( .state == "closed" and .merged == true )' >/dev/null; then
+    log "The pull request has been closed and merged, confirming the reference branch has been deleted ..."
     # Delete the branch if it still exists.
     if [ "$(curl --write-out '%{http_code}' --output /dev/null "$@" "${head_branch_git_reference_endpoint}")" -eq 200 ]; then
-      curl --request DELETE "$@" "${head_branch_git_reference_endpoint}"
+      curl --request DELETE "$@" "${head_branch_git_reference_endpoint}" >/dev/null
+      log "The pull request reference branch has been successfully deleted."
     fi
   else
     warn "The pull request was not merged, this requires manual intervention."
