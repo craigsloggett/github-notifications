@@ -74,6 +74,107 @@ merge_pull_request() {
   fi
 }
 
+process_pull_request() {
+  # Expects a pull request API endpoint as the first positional parameter
+  # and the repository API endpoint as the second.
+  # Returns: 0 (merged), 1 (failed/manual), 2 (already closed).
+  pull_request_endpoint="${1}"
+  repository_endpoint="${2}"
+
+  # Set the default curl options for all GitHub REST API calls.
+  set -- --silent --location
+  # Set valid header values for GitHub REST API requests.
+  set -- "${@}" -H "${accept_header}" -H "${authorization_header}" -H "${api_version_header}"
+
+  # Isolate details of the pull request being processed.
+  pull_request_json="$(curl "$@" "${pull_request_endpoint}")"
+  # The branch whose changes are combined into the base branch when you
+  # merge a pull request. Also known as the "compare branch."
+  head_branch_name="$(printf '%s' "${pull_request_json}" | jq -r '.head.ref')"
+  # The REF in the URL must be formatted as heads/<branch name> for
+  # branches and tags/<tag name> for tags.
+  head_branch_git_reference_endpoint="${repository_endpoint}/git/ref/heads/${head_branch_name}"
+  # The REF can be a SHA, branch name, or a tag name.
+  check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
+
+  # If the pull request is already closed (merged or otherwise), signal to the caller.
+  if printf '%s' "${pull_request_json}" | jq -e '( .state == "closed" )' >/dev/null; then
+    return 2
+  fi
+
+  # Validate the pull request checks have completed successfully.
+  # (returns true if there are no checks configured)
+  if curl "$@" "${check_runs_endpoint}" | validate_checks; then
+    log "Status checks have passed, reviewing the Pull Request type ..."
+  else
+    warn "Status checks have not passed, this pull request requires manual intervention."
+    return 1
+  fi
+
+  # At this point, assume the pull request is open and the ref branch exists, and the status checks have passed.
+  case "${head_branch_name}" in
+    *dependabot/github_actions*)
+      log "Dependabot is updating a GitHub Actions dependency, merging the pull request ..."
+      merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || return 1
+      ;;
+    *dependabot/go_modules*)
+      log "Dependabot is updating a Go module dependency, merging the pull request ..."
+      merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || return 1
+      ;;
+    *)
+      warn "This pull request requires manual intervention."
+      return 1
+      ;;
+  esac
+}
+
+process_org_pull_requests() {
+  # Expects a GitHub org/user name as the first positional parameter and
+  # a newline-delimited list of already-processed PR URLs as the second.
+  org="${1}"
+  already_processed="${2}"
+
+  # Set the default curl options for all GitHub REST API calls.
+  set -- --silent --location
+  # Set valid header values for GitHub REST API requests.
+  set -- "${@}" -H "${accept_header}" -H "${authorization_header}" -H "${api_version_header}"
+
+  log ""
+  log "Searching for open Dependabot pull requests in the ${org} org ..."
+
+  page=1
+  while true; do
+    search_results="$(curl "$@" "https://api.github.com/search/issues?q=is:open+is:pr+user:${org}+author:app/dependabot&per_page=100&page=${page}")"
+    result_count="$(printf '%s' "${search_results}" | jq '.items | length')"
+
+    if [ "${result_count}" -eq 0 ]; then
+      break
+    fi
+
+    printf '%s' "${search_results}" | jq -c '.items[]' |
+      while read -r item; do
+        pull_request_endpoint="$(printf '%s' "${item}" | jq -r '.pull_request.url')"
+        repository_endpoint="$(printf '%s' "${item}" | jq -r '.repository_url')"
+
+        # Skip PRs already processed via notifications.
+        case "${already_processed}" in
+          *"${pull_request_endpoint}"*)
+            log ""
+            log "Skipping already-processed PR: ${pull_request_endpoint}"
+            continue
+            ;;
+        esac
+
+        log ""
+        log "Processing org PR: ${pull_request_endpoint}"
+
+        process_pull_request "${pull_request_endpoint}" "${repository_endpoint}" || true
+      done
+
+    page=$((page + 1))
+  done
+}
+
 main() {
   set -euf
 
@@ -112,8 +213,13 @@ main() {
   # Filter the notifications endpoint response on subject type to grab pull request notifications.
   pull_request_notifications_json="$(curl "$@" "${notifications_endpoint}" | jq -r '.[] | select( .subject.type == "PullRequest" )')"
 
+  # Track processed PR endpoints for deduplication with the org search.
+  processed_pull_requests=""
+
   # Iterate over each unique pull request notification thread identifier.
-  printf '%s' "${pull_request_notifications_json}" | jq -r '.id' |
+  # Uses a here-document instead of a pipe to avoid running the loop body
+  # in a subshell, which would prevent processed_pull_requests from persisting.
+  if [ -n "${pull_request_notifications_json}" ]; then
     while read -r notification_thread_id; do
       # Isolate details of the notification being processed.
       notification_thread_json="$(printf '%s' "${pull_request_notifications_json}" | jq -r "select( .id == \"${notification_thread_id}\" )")"
@@ -121,68 +227,37 @@ main() {
       repository_endpoint="$(printf '%s' "${notification_thread_json}" | jq -r '.repository.url')"
       pull_request_endpoint="$(printf '%s' "${notification_thread_json}" | jq -r '.subject.url')"
 
-      # Isolate details of the pull request being processed.
-      pull_request_json="$(curl "$@" "${pull_request_endpoint}")"
-      # The branch whose changes are combined into the base branch when you
-      # merge a pull request. Also known as the "compare branch."
-      head_branch_name="$(printf '%s' "${pull_request_json}" | jq -r '.head.ref')"
-      # The REF in the URL must be formatted as heads/<branch name> for
-      # branches and tags/<tag name> for tags.
-      head_branch_git_reference_endpoint="${repository_endpoint}/git/ref/heads/${head_branch_name}"
-      # The REF can be a SHA, branch name, or a tag name.
-      check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
-
       log "" # Create a visual break for new notifications.
       log "Processing notification for: ${pull_request_endpoint}"
 
-      # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
-      if printf '%s' "${pull_request_json}" | jq -e '( .state == "closed" )' >/dev/null; then
-        log "Pull request is closed, marking the notification as done ..."
+      result=0
+      process_pull_request "${pull_request_endpoint}" "${repository_endpoint}" || result=$?
 
-        curl --request PATCH "$@" "${notification_thread_endpoint}"
-        curl --request DELETE "$@" "${notification_thread_endpoint}"
-        continue
-      fi
-
-      # Validate the pull request checks have completed successfully.
-      # (returns true if there are no checks configured)
-      if curl "$@" "${check_runs_endpoint}" | validate_checks; then
-        log "Status checks have passed, reviewing the Pull Request type ..."
-      else
-        warn "Status checks have not passed, this pull request requires manual intervention."
-        continue
-      fi
-
-      # At this point, assume the pull request is open and the ref branch exists, and the status checks have passed.
-      case "${head_branch_name}" in
-        *dependabot/github_actions*)
-          log "Dependabot is updating a GitHub Actions dependency, merging the pull request ..."
-
-          # Merge the pull request.
-          merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
-
-          # Mark the notification as read, then done.
-          log "Pull request has been merged, marking the notification as done ..."
+      case "${result}" in
+        2)
+          log "Pull request is closed, marking the notification as done ..."
           curl --request PATCH "$@" "${notification_thread_endpoint}"
           curl --request DELETE "$@" "${notification_thread_endpoint}"
           ;;
-        *dependabot/go_modules*)
-          log "Dependabot is updating a Go module dependency, merging the pull request ..."
-
-          # Merge the pull request.
-          merge_pull_request "${pull_request_endpoint}" "${head_branch_git_reference_endpoint}" || continue
-
+        0)
           log "Pull request has been merged, marking the notification as done ..."
-
-          # Mark the notification as read, then done.
           curl --request PATCH "$@" "${notification_thread_endpoint}"
           curl --request DELETE "$@" "${notification_thread_endpoint}"
-          ;;
-        *)
-          warn "This pull request requires manual intervention."
           ;;
       esac
-    done
+
+      # Track processed PR endpoints for deduplication.
+      processed_pull_requests="${processed_pull_requests}${pull_request_endpoint}
+"
+    done <<EOF
+$(printf '%s' "${pull_request_notifications_json}" | jq -r '.id')
+EOF
+  fi
+
+  # Process open Dependabot PRs in the configured org, if set.
+  if [ -n "${GH_ORG:-}" ]; then
+    process_org_pull_requests "${GH_ORG}" "${processed_pull_requests}"
+  fi
 }
 
 main "$@"
