@@ -14,6 +14,17 @@ then marks the notifications as done.
 GH_TOKEN="..." ./github-notifications.sh
 ```
 
+### fix-terraform-docs.sh
+
+Searches for open dependabot Terraform pull requests with a failing terraform-docs
+check. For each one, clones the branch to a temporary directory, regenerates the
+documentation, commits, and pushes. Run before `merge-dependabot.sh` so checks
+pass by the time the merge script runs.
+
+```sh
+GH_TOKEN="..." ./fix-terraform-docs.sh <owner>
+```
+
 ### merge-dependabot.sh
 
 Searches for all open dependabot pull requests owned by a given user or
@@ -36,4 +47,6 @@ GH_TOKEN="..." ./merge-dependabot.sh craigsloggett-lab
 
 - `curl`
 - `jq`
+- `git`
+- `terraform-docs` (for `fix-terraform-docs.sh`)
 - A GitHub personal access token with repo and pull request permissions set as `GH_TOKEN`
