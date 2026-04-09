@@ -90,7 +90,7 @@ main() {
   reset='\033[m'
 
   # Ensure required utilities are available.
-  for utility in curl jq; do
+  for utility in curl jq terraform-docs; do
     ensure_utility "${utility}"
   done
 
@@ -151,7 +151,8 @@ main() {
       terraform_docs_check_run_json="$(curl "$@" "${check_runs_endpoint}" |
         jq '.check_runs[] | select( .name == "Terraform Docs" )')"
 
-      if [ -z "${terraform_docs_check_run_json=}" ]; then
+      status=0
+      if [ -z "${terraform_docs_check_run_json}" ]; then
         status=4 # This pull request doesn't have a Terraform Docs check so avoiding an exit.
       else
         printf '%s\n' "${terraform_docs_check_run_json}" | jq -e '.conclusion == "success"' >/dev/null 2>&1 || status="${?}"
@@ -170,7 +171,7 @@ main() {
           else
             log "This can be fixed automatically, starting now ..."
             # Update the local repository.
-            git checkout main --quiet && git pull --quiet && git gone --quiet
+            git checkout main --quiet && git pull --quiet
             git checkout "${head_branch_name}" --quiet
 
             # Generate the README.md and push the changes.
