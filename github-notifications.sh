@@ -38,7 +38,7 @@ validate_checks() {
   # Expects a JSON response from the check-runs GitHub API endpoint as stdin.
   # .check_runs.[] | ( .status == "completed" and .conclusion == "success" ): Returns true for each check that has completed successfully.
   # [ ] | all                                                               : Returns true if all checks have completed successfully, or there are no checks at all.
-  jq -e '[ .check_runs.[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
+  jq -e '[ .check_runs[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
 }
 
 merge_pull_request() {
@@ -131,6 +131,9 @@ main() {
       head_branch_git_reference_endpoint="${repository_endpoint}/git/ref/heads/${head_branch_name}"
       # The REF can be a SHA, branch name, or a tag name.
       check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
+      # The owner and name of the repo used to fix Terraform Docs checks.
+      head_repo_owner="$(printf '%s\n' "${pull_request_json}" | jq -r '.head.repo.owner.login')"
+      head_repo_name="$(printf '%s\n' "${pull_request_json}" | jq -r '.head.repo.name')"
 
       log "" # Create a visual break for new notifications.
       log "Processing notification for: ${pull_request_endpoint}"
@@ -143,6 +146,67 @@ main() {
         curl --request DELETE "$@" "${notification_thread_endpoint}"
         continue
       fi
+
+      # Check Terraform Docs first to see if we can clean this up.
+      terraform_docs_check_run_json="$(curl "$@" "${check_runs_endpoint}" |
+        jq '.check_runs[] | select( .name == "Terraform Docs" )')"
+
+      if [ -z "${terraform_docs_check_run_json=}" ]; then
+        status=4 # This pull request doesn't have a Terraform Docs check so avoiding an exit.
+      else
+        printf '%s\n' "${terraform_docs_check_run_json}" | jq -e '.conclusion == "success"' >/dev/null 2>&1 || status="${?}"
+      fi
+
+      case "${status}" in
+        0)
+          : # The Terraform Docs check has passed so nothing to do.
+          ;;
+        1)
+          warn "The Terraform Docs check has failed ..."
+
+          cd "${HOME}/Developer/GitHub/${head_repo_owner}/${head_repo_name}"
+          if [ -n "$(git status --porcelain)" ]; then
+            warn "There are unfinished changes to be committed in this directory, unable to fix ..."
+          else
+            log "This can be fixed automatically, starting now ..."
+            # Update the local repository.
+            git checkout main --quiet && git pull --quiet && git gone --quiet
+            git checkout "${head_branch_name}" --quiet
+
+            # Generate the README.md and push the changes.
+            terraform-docs . >/dev/null
+            git add README.md
+            git commit -m 'docs: Generate README.md with terraform-docs'
+            git push --quiet
+            log "Generated the README and pushed the changes ..."
+
+            # Get the Terraform Docs check run JSON after pushing the latest changes.
+            terraform_docs_check_run_json="$(curl "$@" "${check_runs_endpoint}" |
+              jq '.check_runs[] | select( .name == "Terraform Docs" )')"
+
+            while
+              ! printf '%s\n' "${terraform_docs_check_run_json}" |
+                jq -e '.status == "completed"' >/dev/null 2>&1
+            do
+              log "Waiting for Terraform Docs check to complete ..."
+              sleep 10
+
+              # Update the Terraform Docs check run JSON.
+              terraform_docs_check_run_json="$(curl "$@" "${check_runs_endpoint}" |
+                jq '.check_runs[] | select( .name == "Terraform Docs" )')"
+            done
+
+            if ! printf '%s\n' "${terraform_docs_check_run_json}" |
+              jq -e '.conclusion == "success"' >/dev/null 2>&1; then
+              warn "Terraform Docs check completed but did not succeed, this pull request requires manual intervention."
+              continue
+            fi
+          fi
+          ;;
+        *)
+          : # This pull request doesn't have a Terraform Docs check so nothing to do.
+          ;;
+      esac
 
       # Validate the pull request checks have completed successfully.
       # (returns true if there are no checks configured)
