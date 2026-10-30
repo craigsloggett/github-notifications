@@ -1,52 +1,27 @@
 # github-notifications
 
-Utilities to manage GitHub notifications and pull requests automatically.
+Triage GitHub pull request notifications for the authenticated user.
 
-## Scripts
-
-### github-notifications.sh
-
-Processes pull request notifications for the authenticated user. Auto-merges
-dependabot PRs (GitHub Actions and Go modules) that have passing status checks,
-then marks the notifications as done.
+## Usage
 
 ```sh
-GH_TOKEN="..." ./github-notifications.sh
+./github-notifications.sh [--dry-run]
 ```
 
-### fix-terraform-docs.sh
+For each pull request notification, the script:
 
-Searches for open dependabot Terraform pull requests with a failing terraform-docs
-check. For each one, clones the branch to a temporary directory, regenerates the
-documentation, commits, and pushes. Run before `merge-dependabot.sh` so checks
-pass by the time the merge script runs.
+1. Marks the notification as done when the pull request is closed.
+2. Squash-merges the pull request and marks the notification as done when
+   Dependabot opened it, every check run on its head commit has succeeded, and
+   GitHub reports it as clean to merge.
+3. Reports every other pull request for manual review, leaving the notification
+   in the inbox.
 
-```sh
-GH_TOKEN="..." ./fix-terraform-docs.sh <owner>
-```
-
-### merge-dependabot.sh
-
-Searches for all open dependabot pull requests owned by a given user or
-organization and auto-merges (squash) those with passing status checks. Skips
-PRs with merge conflicts or failing checks. Processes oldest PRs first to handle
-dependency chains.
-
-```sh
-GH_TOKEN="..." ./merge-dependabot.sh <owner>
-```
-
-For example:
-
-```sh
-GH_TOKEN="..." ./merge-dependabot.sh craigsloggett
-GH_TOKEN="..." ./merge-dependabot.sh craigsloggett-lab
-```
+`--dry-run` reports what the script would do without merging any pull request
+or marking any notification as done.
 
 ## Requirements
 
-- `curl`
+- `gh`, authenticated with `gh auth login` or a `GH_TOKEN` environment variable
+  that has `repo` scope
 - `jq`
-- `git`
-- `terraform-docs` (for `fix-terraform-docs.sh`)
-- A GitHub personal access token with repo and pull request permissions set as `GH_TOKEN`
