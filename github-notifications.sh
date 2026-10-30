@@ -1,16 +1,12 @@
 #!/bin/sh
 #
-# Triage GitHub pull request notifications for the authenticated user.
+# Triage GitHub pull request notifications for the authenticated user. The
+# notifications for closed pull requests are marked as done, Dependabot pull
+# requests whose checks have all passed are squash-merged and their
+# notifications marked as done, and every other pull request is reported for
+# manual review with its notification left in the inbox.
 
 set -euf
-
-# Ensure required utilities are available.
-for utility in gh jq; do
-  if ! command -v "${utility}" >/dev/null 2>&1; then
-    printf '%s\n' "ERROR: The following utility is not available and is required --> ${utility}" >&2
-    exit 1
-  fi
-done
 
 # trap_exit reports a non-zero exit status to stderr when the script ends.
 trap_exit() (
@@ -43,6 +39,31 @@ die() {
   exit 1
 }
 
+# parse_arguments sets dry_run from the command line, rejecting anything else.
+parse_arguments() {
+  dry_run=false
+
+  for argument in "$@"; do
+    case "${argument}" in
+      --dry-run) dry_run=true ;;
+      *) die "Unknown argument: ${argument}" ;;
+    esac
+  done
+}
+
+# check_requirements verifies the required utilities are installed and that gh
+# is authenticated.
+check_requirements() {
+  for utility in gh jq; do
+    command -v "${utility}" >/dev/null 2>&1 ||
+      die "The following utility is not available and is required --> ${utility}"
+  done
+
+  # gh authenticates through `gh auth login` or the GH_TOKEN environment variable.
+  gh auth status >/dev/null 2>&1 ||
+    die "gh is not authenticated, run 'gh auth login' or set the GH_TOKEN environment variable."
+}
+
 # validate_checks reads a check-runs API response from stdin and succeeds when
 # every check run has completed successfully, or when there are no check runs.
 validate_checks() {
@@ -57,9 +78,18 @@ mark_notification_done() (
     gh api --silent --method DELETE "${notification_thread_endpoint}"
 )
 
-# triage_pull_request_notification reports on the pull request behind a
-# notification thread, marking the thread as done when the pull request is
-# closed, and never changing the pull request itself.
+# merge_pull_request squash-merges a pull request, with GitHub refusing the
+# merge if the head has moved from the SHA whose checks were validated.
+merge_pull_request() (
+  pull_request_endpoint="${1:?pull request endpoint is required}"
+  head_sha="${2:?head SHA is required}"
+
+  gh api --silent --method PUT "${pull_request_endpoint}/merge" \
+    -f merge_method=squash -f sha="${head_sha}"
+)
+
+# triage_pull_request_notification acts on the pull request behind a
+# notification thread
 triage_pull_request_notification() (
   notification_thread_json="${1:?notification thread JSON is required}"
 
@@ -75,8 +105,12 @@ triage_pull_request_notification() (
     return
   fi
 
-  # If the pull request is already closed (merged or otherwise), clear the notification and move on to the next one.
   if printf '%s' "${pull_request_json}" | jq -e '( .state == "closed" )' >/dev/null; then
+    if [ "${dry_run}" = true ]; then
+      log "Pull request is closed, dry run so leaving the notification in the inbox."
+      return
+    fi
+
     log "Pull request is closed, marking the notification as done ..."
 
     mark_notification_done "${notification_thread_endpoint}" ||
@@ -84,64 +118,83 @@ triage_pull_request_notification() (
     return
   fi
 
-  # The branch whose changes are combined into the base branch when you
-  # merge a pull request. Also known as the "compare branch."
-  head_branch_name="$(printf '%s' "${pull_request_json}" | jq -r '.head.ref')"
-  # The REF can be a SHA, branch name, or a tag name.
-  check_runs_endpoint="${repository_endpoint}/commits/${head_branch_name}/check-runs"
+  if ! printf '%s' "${pull_request_json}" |
+    jq -e --arg login "${dependabot_login}" '.user.login == $login' >/dev/null; then
+    warn "This pull request was not opened by Dependabot, it requires manual intervention."
+    return
+  fi
 
-  if ! check_runs_json="$(gh api "${check_runs_endpoint}")"; then
+  log "Dependabot opened this pull request, reviewing the status checks ..."
+
+  head_sha="$(printf '%s' "${pull_request_json}" | jq -r '.head.sha')"
+  check_runs_endpoint="${repository_endpoint}/commits/${head_sha}/check-runs"
+
+  if ! check_runs_json="$(gh api --method GET -F per_page=100 "${check_runs_endpoint}")"; then
     warn "Unable to retrieve the status checks, this pull request requires manual intervention."
     return
   fi
 
-  # Validate the pull request checks have completed successfully.
-  # (returns true if there are no checks configured)
   if ! printf '%s' "${check_runs_json}" | validate_checks; then
-    warn "Status checks have not passed, this pull request requires manual intervention."
+    warn "Status checks have not all completed successfully, this pull request requires manual intervention."
     return
   fi
 
-  log "Status checks have passed, reviewing the Pull Request type ..."
+  mergeable_state="$(printf '%s' "${pull_request_json}" | jq -r '.mergeable_state')"
 
-  # At this point, the pull request is open and the status checks have passed.
-  case "${head_branch_name}" in
-    *dependabot/github_actions*)
-      log "Dependabot is updating a GitHub Actions dependency, this pull request is ready to be merged."
-      ;;
-    *dependabot/go_modules*)
-      log "Dependabot is updating a Go module dependency, this pull request is ready to be merged."
+  case "${mergeable_state}" in
+    clean) ;;
+    unknown)
+      warn "GitHub has not finished calculating whether the pull request can be merged, run the script again shortly."
+      return
       ;;
     *)
-      warn "This pull request requires manual intervention."
+      warn "GitHub reports the pull request as '${mergeable_state}' rather than 'clean', this pull request requires manual intervention."
+      return
       ;;
   esac
+
+  if [ "${dry_run}" = true ]; then
+    log "Dependabot pull request is ready to be merged, dry run so leaving it open."
+    return
+  fi
+
+  log "Dependabot pull request is ready to be merged, merging ..."
+
+  if ! merge_pull_request "${pull_request_endpoint}" "${head_sha}"; then
+    warn "Unable to merge the pull request, this pull request requires manual intervention."
+    return
+  fi
+
+  log "Pull request has been merged, marking the notification as done ..."
+
+  mark_notification_done "${notification_thread_endpoint}" ||
+    warn "Unable to mark the notification as done, this notification requires manual intervention."
 )
 
-# main lists the pull request notifications for the authenticated user and
-# triages each one in turn.
 main() {
-  # trap will catch all EXIT signals from here forward.
   trap trap_exit EXIT
 
-  # ANSI escape sequences used for text output.
   bold_yellow='\033[1;33m'
   bold_red='\033[1;31m'
   bold='\033[1m'
   reset='\033[m'
 
-  # gh authenticates through `gh auth login` or the GH_TOKEN environment variable.
-  gh auth status >/dev/null 2>&1 ||
-    die "gh is not authenticated, run 'gh auth login' or set the GH_TOKEN environment variable."
+  # The login GitHub assigns to the Dependabot app when it opens pull requests.
+  dependabot_login='dependabot[bot]'
+
+  parse_arguments "$@"
+  check_requirements
+
+  if [ "${dry_run}" = true ]; then
+    log "Dry run, no pull requests will be merged and no notifications will be marked as done."
+  fi
 
   log "Listing notifications for the authenticated user ..."
 
-  # Filter the notifications endpoint response on subject type to grab pull request notifications.
   pull_request_notifications_json="$(
     gh api --paginate notifications --jq '.[] | select( .subject.type == "PullRequest" )'
   )" || die "Unable to list notifications."
 
-  # Iterate over each pull request notification thread, one compact JSON object per line.
   printf '%s\n' "${pull_request_notifications_json}" | jq -c '.' |
     while read -r notification_thread_json; do
       triage_pull_request_notification "${notification_thread_json}"
