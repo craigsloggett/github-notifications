@@ -3,8 +3,10 @@
 # Triage GitHub pull request notifications for the authenticated user. The
 # notifications for closed pull requests are marked as done, Dependabot pull
 # requests whose checks have all passed are squash-merged and their
-# notifications marked as done, and every other pull request is reported for
-# manual review with its notification left in the inbox.
+# notifications marked as done, Dependabot pull requests failing only the
+# Terraform Docs check have their README.md regenerated and pushed, and every
+# other pull request is reported for manual review with its notification left
+# in the inbox.
 
 set -euf
 
@@ -54,7 +56,7 @@ parse_arguments() {
 # check_requirements verifies the required utilities are installed and that gh
 # is authenticated.
 check_requirements() {
-  for utility in gh jq; do
+  for utility in gh jq git terraform-docs; do
     command -v "${utility}" >/dev/null 2>&1 ||
       die "The following utility is not available and is required --> ${utility}"
   done
@@ -69,6 +71,18 @@ check_requirements() {
 validate_checks() {
   jq -e '[ .check_runs[] | ( .status == "completed" and .conclusion == "success" ) ] | all' >/dev/null
 }
+
+# only_check_failed reads a check-runs API response from stdin and succeeds
+# when the named check run failed and every other check run has completed
+# successfully.
+only_check_failed() (
+  check_name="${1:?check name is required}"
+
+  jq -e --arg name "${check_name}" '
+    ( [ .check_runs[] | select( .name == $name ) | .conclusion == "failure" ] | any ) and
+    ( [ .check_runs[] | select( .name != $name ) | ( .status == "completed" and .conclusion == "success" ) ] | all )
+  ' >/dev/null
+)
 
 # mark_notification_done marks a notification thread as read, then as done.
 mark_notification_done() (
@@ -86,6 +100,22 @@ merge_pull_request() (
 
   gh api --silent --method PUT "${pull_request_endpoint}/merge" \
     -f merge_method=squash -f sha="${head_sha}"
+)
+
+# fix_terraform_docs regenerates README.md with terraform-docs on the head
+# branch of a pull request and pushes the resulting commit.
+fix_terraform_docs() (
+  repository_full_name="${1:?repository full name is required}"
+  head_ref="${2:?head ref is required}"
+
+  clone_dir="$(mktemp -d)"
+  readonly clone_dir
+  trap 'rm -rf "${clone_dir}"' EXIT INT TERM HUP
+
+  gh repo clone "${repository_full_name}" "${clone_dir}" -- --quiet --depth 1 --branch "${head_ref}" &&
+    terraform-docs "${clone_dir}" >/dev/null &&
+    git -C "${clone_dir}" commit --quiet --all --message 'docs: Regenerate README.md with terraform-docs' &&
+    git -C "${clone_dir}" push --quiet
 )
 
 # triage_pull_request_notification acts on the pull request behind a
@@ -131,6 +161,26 @@ triage_pull_request_notification() (
 
   if ! check_runs_json="$(gh api --method GET -F per_page=100 "${check_runs_endpoint}")"; then
     warn "Unable to retrieve the status checks, this pull request requires manual intervention."
+    return
+  fi
+
+  if printf '%s' "${check_runs_json}" | only_check_failed "${terraform_docs_check_name}"; then
+    if [ "${dry_run}" = true ]; then
+      log "Only the ${terraform_docs_check_name} check failed, dry run so leaving README.md as is."
+      return
+    fi
+
+    log "Only the ${terraform_docs_check_name} check failed, regenerating README.md with terraform-docs ..."
+
+    repository_full_name="$(printf '%s' "${pull_request_json}" | jq -r '.head.repo.full_name')"
+    head_ref="$(printf '%s' "${pull_request_json}" | jq -r '.head.ref')"
+
+    if ! fix_terraform_docs "${repository_full_name}" "${head_ref}"; then
+      warn "Unable to regenerate README.md, this pull request requires manual intervention."
+      return
+    fi
+
+    log "Pushed the regenerated README.md, run the script again once the status checks finish."
     return
   fi
 
@@ -182,11 +232,14 @@ main() {
   # The login GitHub assigns to the Dependabot app when it opens pull requests.
   dependabot_login='dependabot[bot]'
 
+  # The name of the check run that lints README.md with terraform-docs.
+  terraform_docs_check_name='Terraform Docs'
+
   parse_arguments "$@"
   check_requirements
 
   if [ "${dry_run}" = true ]; then
-    log "Dry run, no pull requests will be merged and no notifications will be marked as done."
+    log "Dry run, no pull requests will be merged, no commits will be pushed, and no notifications will be marked as done."
   fi
 
   log "Listing notifications for the authenticated user ..."
